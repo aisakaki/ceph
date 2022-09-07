@@ -40,6 +40,9 @@ struct OMapInnerNode
   bool extent_will_overflow(size_t ksize, std::optional<size_t> vsize) const {
     return is_overflow(ksize);
   }
+  bool extent_is_overflow() const {
+    return is_overflow();
+  }
   bool can_merge(OMapNodeRef right) const {
     return !is_overflow(*right->cast<OMapInnerNode>());
   }
@@ -103,6 +106,13 @@ struct OMapInnerNode
     omap_context_t oc, internal_iterator_t iter,
     mutation_result_t mresult);
 
+  using handle_split_simple_iertr = base_iertr;
+  using handle_split_simple_ret = handle_split_simple_iertr::future<>;
+  handle_split_simple_ret handle_split_simple(
+    omap_context_t oc,
+    internal_iterator_t iter,
+    mutation_result_t mresult);
+
   std::ostream &print_detail_l(std::ostream &out) const final;
 
   static constexpr extent_types_t TYPE = extent_types_t::OMAP_INNER;
@@ -156,6 +166,9 @@ struct OMapLeafNode
   bool extent_will_overflow(
     size_t ksize, std::optional<size_t> vsize) const {
     return is_overflow(ksize, *vsize);
+  }
+  bool extent_is_overflow() const {
+    return is_overflow();
   }
   bool can_merge(OMapNodeRef right) const {
     return !is_overflow(*right->cast<OMapLeafNode>());

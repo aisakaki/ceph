@@ -187,6 +187,66 @@ BtreeOMapManager::omap_rm_key(
 
 }
 
+//[FIXME 1]can root be seen as LeafNode?
+//[FIXME 2]handle root merge/split should be recursively?
+BtreeOMapManager::omap_rm_key_range_ret
+BtreeOMapManager::omap_rm_key_range(
+  omap_root_t &omap_root,
+  Transaction &t,
+  const std::string &start,
+  const std::string &last)
+{
+  LOG_PREFIX(BtreeOMapManager::omap_rm_key_range);
+  DEBUGT("start: {}, last: {}", t, start, last);
+  assert(last > start);
+  if (omap_root.get_depth() == 1) {
+    return get_omap_root(
+      get_omap_context(t, omap_root.hint),
+      omap_root
+    ).si_then(
+      [&start, &last, &t](auto root) { //[FIXME] capture t or &t?
+      LOG_PREFIX(BtreeOMapManager::omap_rm_key_range);
+      auto leafnode = root->template cast<OMapLeafNode>();
+      auto key_lit = leafnode->string_lower_bound(start);
+      auto key_rit = leafnode->string_upper_bound(last) - 1;
+      DEBUGT("rm all target keys: {} ~ {} in root",
+	t, key_lit->get_key(), key_rit->get_key());
+      leafnode->journal_leaf_range_remove(
+	key_lit, key_rit + 1,
+	leafnode->maybe_get_delta_buffer());
+      return seastar::now();
+    });
+  } else {
+    assert(omap_root.get_depth() > 1);
+    std::vector<laddr_t> start_laddr;
+    start_laddr.push_back(omap_root.get_location());
+    return rm_key_range(
+      get_omap_context(t, omap_root.hint),
+      std::move(start_laddr),
+      omap_root.get_depth(),
+      start, last
+    ).si_then(
+      [this, &omap_root, &t](auto bound_result) {
+      assert(bound_result.first == bound_result.second);
+      auto mresult = bound_result.first;
+      if (mresult.status == mutation_status_t::SUCCESS) {
+	return seastar::now();
+      } else if (mresult.status == mutation_status_t::WAS_SPLIT) {
+	return handle_root_split(get_omap_context(t, omap_root.hint), omap_root, mresult);
+      } else if (mresult.status == mutation_status_t::NEED_MERGE) {
+	auto root = *(mresult.need_merge);
+	if (root->get_node_size() == 1 && omap_root.depth != 1) {
+	  return handle_root_merge(get_omap_context(t, omap_root.hint), omap_root, mresult);
+	} else {
+	  return seastar::now();
+	}
+      } else {
+	return seastar::now();
+      }
+    });
+  }
+}
+
 BtreeOMapManager::omap_list_ret
 BtreeOMapManager::omap_list(
   const omap_root_t &omap_root,

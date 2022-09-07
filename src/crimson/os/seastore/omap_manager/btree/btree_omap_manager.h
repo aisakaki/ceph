@@ -60,7 +60,7 @@ class BtreeOMapManager : public OMapManager {
   handle_root_merge_ret handle_root_merge(
     omap_context_t oc,
     omap_root_t &omap_root, 
-    OMapNode:: mutation_result_t mresult);
+    OMapNode::mutation_result_t mresult);
 
 public:
   explicit BtreeOMapManager(TransactionManager &tm);
@@ -86,6 +86,12 @@ public:
     omap_root_t &omap_root,
     Transaction &t,
     const std::string &key) final;
+
+  omap_rm_key_range_ret omap_rm_key_range(
+    omap_root_t &omap_root,
+    Transaction &t,
+    const std::string &start,
+    const std::string &last) final;
 
   omap_list_ret omap_list(
     const omap_root_t &omap_root,

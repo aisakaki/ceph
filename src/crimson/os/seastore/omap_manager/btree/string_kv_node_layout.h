@@ -84,6 +84,22 @@ static void copy_from_local(
           to_src->get_node_key_ptr() - from_src->get_node_key_ptr());
 }
 
+template <typename T, typename SC>
+void get_middle(T &left, T &right, SC &from_list, SC &tgt_list) {
+  if (left != right) {
+    bool left_found = false;
+    for (auto it = from_list.begin(); it < from_list.end(); ++it) {
+      if (left_found) {
+	if (*it != right) {
+	  tgt_list.push_back(*it);
+	} else break;
+      } else if (*it == left) {
+	left_found = true;
+      }
+    }
+  }
+}
+
 struct delta_inner_t {
   enum class op_t : uint_fast8_t {
     INSERT,
@@ -504,6 +520,25 @@ public:
     inner_remove(iter);
   }
 
+  void journal_inner_range_remove(
+    const_iterator _iter_begin,
+    const_iterator _iter_end,  //left closed right open.
+    delta_inner_buffer_t *recorder)
+  {
+    assert(_iter_end <= iter_end());
+    if (_iter_end - _iter_begin < 1) return;
+    unsigned len = 0;
+    //[TODO] realize range remove delta recorder.
+    for (auto _iter =_iter_begin; _iter < _iter_end; _iter++) {
+      auto iter = iterator(this, _iter.index);
+      if (recorder) {
+	recorder->remove(iter->get_key());
+      }
+      len += iter->get_node_key().key_len;
+    }
+    inner_range_remove(_iter_begin, _iter_end, len);
+  }
+
   StringKVInnerNodeLayout(char *buf) :
     buf(buf) {}
 
@@ -663,6 +698,10 @@ public:
 
   bool is_overflow(const StringKVInnerNodeLayout &rhs) const {
     return free_space() < rhs.used_space();
+  }
+
+  bool is_overflow() const {
+    return free_space() < 0;
   }
 
   bool below_min() const {
@@ -836,7 +875,7 @@ private:
     if (iter != iter_end()) {
       assert(iter->get_key() > key);
     }
-    assert(!is_overflow(key.size()));
+    // assert(!is_overflow(key.size()));
 
     if (iter != iter_end()) {
       copy_from_local(key.size(), iter + 1, iter, iter_end());
@@ -871,6 +910,15 @@ private:
     if ((iter + 1) != iter_end())
       copy_from_local(iter->get_node_key().key_len, iter, iter + 1, iter_end());
     set_size(get_size() - 1);
+  }
+
+  void inner_range_remove(
+    iterator it_begin,
+    iterator it_end,
+    unsigned len) {
+    if (it_end != iter_end())
+      copy_from_local(len, it_begin, it_end, iter_end());
+    set_size(get_size() - (it_end - it_begin));
   }
 
   /**
@@ -982,6 +1030,16 @@ public:
     uint16_t operator>(const iter_t &rhs) const {
       assert(rhs.node == node);
       return index > rhs.index;
+    }
+
+    uint16_t operator<=(const iter_t &rhs) const {
+      assert(rhs.node == node);
+      return index <= rhs.index;
+    }
+
+    uint16_t operator>=(const iter_t &rhs) const {
+      assert(rhs.node == node);
+      return index >= rhs.index;
     }
 
     bool operator==(const iter_t &rhs) const {
@@ -1118,6 +1176,26 @@ public:
       recorder->remove(iter->get_key());
     }
     leaf_remove(iter);
+  }
+
+  void journal_leaf_range_remove(
+    const_iterator _iter_begin,
+    const_iterator _iter_end,  //left closed right open.
+    delta_leaf_buffer_t *recorder)
+  {
+    assert(_iter_end <= iter_end());
+    if (_iter_end - _iter_begin < 1) return;
+    unsigned len = 0;
+    //[TODO] realize range remove delta recorder.
+    for (auto _iter =_iter_begin; _iter < _iter_end; _iter++) {
+      auto iter = iterator(this, _iter.index);
+      if (recorder) {
+	recorder->remove(iter->get_key());
+      }
+      omap_leaf_key_t key = iter->get_node_key();
+      len += key.key_len + key.val_len;
+    }
+    leaf_range_remove(_iter_begin, _iter_end, len);
   }
 
   StringKVLeafNodeLayout(char *buf) :
@@ -1275,6 +1353,10 @@ public:
 
   bool is_overflow(const StringKVLeafNodeLayout &rhs) const {
     return free_space() < rhs.used_space();
+  }
+
+  bool is_overflow() const {
+    return free_space() < 0;
   }
 
   bool below_min() const {
@@ -1448,7 +1530,7 @@ private:
     if (iter != iter_end()) {
       assert(iter->get_key() > key);
     }
-    assert(!is_overflow(key.size(), val.length()));
+    // assert(!is_overflow(key.size(), val.length()));
     omap_leaf_key_t node_key;
     if (iter == iter_begin()) {
       node_key.key_off = key.size() + val.length();
@@ -1485,6 +1567,15 @@ private:
       copy_from_local(key.key_len + key.val_len, iter, iter + 1, iter_end());
     }
     set_size(get_size() - 1);
+  }
+
+  void leaf_range_remove(
+    iterator it_begin,
+    iterator it_end,
+    unsigned len) {
+    if (it_end != iter_end())
+      copy_from_local(len, it_begin, it_end, iter_end());
+    set_size(get_size() - (it_end - it_begin));
   }
 
   /**

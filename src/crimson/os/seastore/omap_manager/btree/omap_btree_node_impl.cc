@@ -115,6 +115,29 @@ OMapInnerNode::handle_split(
   }
 }
 
+OMapInnerNode::handle_split_simple_ret
+OMapInnerNode::handle_split_simple(
+  omap_context_t oc,
+  internal_iterator_t iter,
+  mutation_result_t mresult)
+{
+  //might cause overflow, must check_status finally.
+  LOG_PREFIX(OMapInnerNode::handle_split_simple);
+  DEBUGT("this: {}",  oc.t, *this);
+  if (!is_pending()) {
+    auto mut = oc.tm.get_mutable_extent(oc.t, this)->cast<OMapInnerNode>();
+    auto mut_iter = mut->iter_idx(iter.get_index());
+    return mut->handle_split(oc, mut_iter, mresult);
+  }
+  auto child = iter.get_val();
+  auto [left, right, pivot] = *(mresult.split_tuple);
+  journal_inner_update(iter, left->get_laddr(), maybe_get_delta_buffer());
+  journal_inner_insert(iter + 1, right->get_laddr(), pivot,
+    maybe_get_delta_buffer());
+  ++(oc.t.get_omap_tree_stats().extents_num_delta);
+  return dec_ref(oc, child);
+}
+
 OMapInnerNode::get_value_ret
 OMapInnerNode::get_value(
   omap_context_t oc,

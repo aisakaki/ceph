@@ -93,6 +93,14 @@ public:
     Transaction &t,
     const std::string &key) = 0;
 
+  using omap_rm_key_range_iertr = base_iertr;
+  using omap_rm_key_range_ret = omap_rm_key_range_iertr::future<>;
+  virtual omap_rm_key_range_ret omap_rm_key_range(
+    omap_root_t &omap_root,
+    Transaction &t,
+    const std::string &start,
+    const std::string &last) = 0;
+
   /**
    * omap_list
    *
