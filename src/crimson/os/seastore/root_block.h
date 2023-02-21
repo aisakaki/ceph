@@ -38,7 +38,7 @@ struct RootBlock : CachedExtent {
 
   root_t root;
 
-  RootBlock() : CachedExtent(0) {}
+  RootBlock() : CachedExtent(ceph::bufferptr(0)) {}
 
   RootBlock(const RootBlock &rhs) = default;
 

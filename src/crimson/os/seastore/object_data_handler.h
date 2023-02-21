@@ -19,7 +19,7 @@ namespace crimson::os::seastore {
 struct ObjectDataBlock : crimson::os::seastore::LogicalCachedExtent {
   using Ref = TCachedExtentRef<ObjectDataBlock>;
 
-  ObjectDataBlock(ceph::bufferptr &&ptr)
+  ObjectDataBlock(std::optional<ceph::bufferptr> &&ptr)
     : LogicalCachedExtent(std::move(ptr)) {}
   ObjectDataBlock(const ObjectDataBlock &other)
     : LogicalCachedExtent(other) {}
