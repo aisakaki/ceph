@@ -353,6 +353,11 @@ public:
     return dirty_from_or_retired_at;
   }
 
+  /// Return true if extent has actual data
+  bool has_actual_data() const {
+    return ptr.has_value();
+  }
+
   /**
    * get_paddr
    *
@@ -362,7 +367,13 @@ public:
   paddr_t get_paddr() const { return poffset; }
 
   /// Returns length of extent
-  virtual extent_len_t get_length() const { return ptr.length(); }
+  virtual extent_len_t get_length() const {
+    if (ptr.has_value()) {
+      return ptr->length();
+    } else {
+      return 0;
+    }
+  }
 
   /// Returns version, get_version() == 0 iff is_clean()
   extent_version_t get_version() const {
@@ -378,8 +389,14 @@ public:
   }
 
   /// Get ref to raw buffer
-  bufferptr &get_bptr() { return ptr; }
-  const bufferptr &get_bptr() const { return ptr; }
+  bufferptr &get_bptr() {
+    assert(ptr.has_value());
+    return *ptr;
+  }
+  const bufferptr &get_bptr() const {
+    assert(ptr.has_value());
+    return *ptr;
+  }
 
   /// Compare by paddr
   friend bool operator< (const CachedExtent &a, const CachedExtent &b) {
@@ -469,8 +486,8 @@ private:
    */
   journal_seq_t dirty_from_or_retired_at;
 
-  /// Actual data contents
-  ceph::bufferptr ptr;
+  /// Actual data contents, std::nullopt if no data
+  std::optional<ceph::bufferptr> ptr;
 
   /// number of deltas since initial write
   extent_version_t version = 0;
@@ -511,21 +528,29 @@ private:
 
 protected:
   CachedExtent(CachedExtent &&other) = delete;
-  CachedExtent(ceph::bufferptr &&ptr) : ptr(std::move(ptr)) {}
+  CachedExtent(std::optional<ceph::bufferptr> &&ptr) : ptr(std::move(ptr)) {}
   CachedExtent(const CachedExtent &other)
     : state(other.state),
       dirty_from_or_retired_at(other.dirty_from_or_retired_at),
-      ptr(other.ptr.c_str(), other.ptr.length()),
       version(other.version),
-      poffset(other.poffset) {}
+      poffset(other.poffset) {
+      if (other.ptr.has_value()) {
+        ptr = std::make_optional<ceph::bufferptr>
+          (other.ptr->c_str(), other.ptr->length());
+      }
+  }
 
   struct share_buffer_t {};
   CachedExtent(const CachedExtent &other, share_buffer_t) :
     state(other.state),
     dirty_from_or_retired_at(other.dirty_from_or_retired_at),
-    ptr(other.ptr),
     version(other.version),
-    poffset(other.poffset) {}
+    poffset(other.poffset) {
+      if (other.ptr.has_value()) {
+        ptr = std::make_optional<ceph::bufferptr>
+          (other.ptr->c_str(), other.ptr->length());
+      }
+  }
 
   struct retired_placeholder_t{};
   CachedExtent(retired_placeholder_t) : state(extent_state_t::INVALID) {}
