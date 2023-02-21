@@ -335,6 +335,54 @@ public:
   }
 
   /**
+   * to_write_addr_info_t
+   *
+   * The meaning of laddr, paddr, bp is the laddr, paddr, buffer of original
+   * extent, which will be remapped to new extents.
+   * The meaning of existing_laddr is that the new extent's laddr.
+   * The meaning of existing_paddr is that the new extent to be
+   * written is the part of exising extent on the disk. existing_paddr
+   * must be absolute.
+   */
+  struct to_write_addr_info_t {
+    /// laddr of original extent
+    std::optional<laddr_t> laddr;
+    /// paddr of original extent
+    std::optional<paddr_t> paddr;
+    /// laddr of existing extent, or new data extent laddr
+    std::optional<laddr_t> existing_laddr;
+    /// paddr of existing extent
+    std::optional<paddr_t> existing_paddr;
+
+    /// content bufferptr of original extent
+    std::optional<ceph::bufferptr> bp;
+
+    extent_len_t get_existing_loffset() const {
+      return *existing_laddr - *laddr;
+    }
+
+    void set_bp(std::optional<ceph::bufferptr> &&bp) {
+      this->bp = std::move(bp);
+    }
+
+    std::optional<ceph::bufferptr> get_bp() const {
+      return bp;
+    }
+
+    to_write_addr_info_t(const to_write_addr_info_t &) = default;
+    to_write_addr_info_t(to_write_addr_info_t &&) = default;
+
+    /// used when extent_to_write_t.type != EXISTING
+    to_write_addr_info_t(laddr_t addr) : existing_laddr(addr) {}
+
+    /// used when extent_to_write_t.type == EXISTING
+    to_write_addr_info_t(laddr_t laddr, paddr_t paddr,
+      laddr_t existing_laddr, paddr_t existing_paddr)
+      : laddr(laddr), paddr(paddr),
+      existing_laddr(existing_laddr), existing_paddr(existing_paddr) {}
+  };
+
+  /**
    * map_existing_extent
    *
    * Allocates a new extent at given existing_paddr that must be absolute and
@@ -351,16 +399,22 @@ public:
   template <typename T>
   map_existing_extent_ret<T> map_existing_extent(
     Transaction &t,
-    laddr_t laddr_hint,
-    paddr_t existing_paddr,
+    to_write_addr_info_t addr_info,
     extent_len_t length) {
+    auto laddr = *(addr_info.laddr);
+    auto paddr = *(addr_info.paddr);
+    auto existing_laddr = *(addr_info.existing_laddr);
+    auto existing_paddr = *(addr_info.existing_paddr);
+    auto offset = addr_info.get_existing_loffset();
+
     LOG_PREFIX(TransactionManager::map_existing_extent);
     // FIXME: existing_paddr can be absolute and pending
     ceph_assert(existing_paddr.is_absolute());
     assert(t.is_retired(existing_paddr, length));
 
-    SUBDEBUGT(seastore_tm, " laddr_hint: {} existing_paddr: {} length: {}",
-	      t, laddr_hint, existing_paddr, length);
+    SUBDEBUGT(seastore_tm, " laddr: {} paddr: {} existing_laddr: {}, "
+              "existing_paddr: {} length: {}",
+	      t, laddr, paddr, existing_laddr, existing_paddr, length);
     auto bp = ceph::bufferptr(buffer::create_page_aligned(length));
     bp.zero();
 
@@ -377,11 +431,11 @@ public:
 
     return lba_manager->alloc_extent(
       t,
-      laddr_hint,
+      existing_laddr,
       length,
       existing_paddr
-    ).si_then([ext=std::move(ext), laddr_hint, this](auto &&ref) {
-      ceph_assert(laddr_hint == ref->get_key());
+    ).si_then([ext=std::move(ext), existing_laddr, this](auto &&ref) {
+      ceph_assert(existing_laddr == ref->get_key());
       ext->set_pin(std::move(ref));
       return epm->read(
         ext->get_paddr(),

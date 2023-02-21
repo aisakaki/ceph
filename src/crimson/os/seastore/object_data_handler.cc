@@ -37,13 +37,11 @@ auto read_pin(
 /**
  * extent_to_write_t
  *
- * Encapsulates extents to be written out using do_insertions.
+ * Encapsulates extents to be written out using do_insertions and do_remapping.
  * Indicates a zero/existing extent or a data extent based on whether
  * to_write is populate.
- * The meaning of existing_paddr is that the new extent to be
- * written is the part of exising extent on the disk. existing_paddr
- * must be absolute.
  */
+using to_write_addr_info_t = TransactionManager::to_write_addr_info_t;
 struct extent_to_write_t {
   enum class type_t {
     DATA,
@@ -52,12 +50,10 @@ struct extent_to_write_t {
   };
 
   type_t type;
-  laddr_t addr;
-  extent_len_t len;
+  to_write_addr_info_t addr_info;
   /// non-nullopt if and only if type == DATA
   std::optional<bufferlist> to_write;
-  /// non-nullopt if and only if type == EXISTING
-  std::optional<paddr_t> existing_paddr;
+  extent_len_t len;
 
   extent_to_write_t(const extent_to_write_t &) = default;
   extent_to_write_t(extent_to_write_t &&) = default;
@@ -74,8 +70,12 @@ struct extent_to_write_t {
     return type == type_t::EXISTING;
   }
 
+  laddr_t get_addr() const {
+    return *(addr_info.existing_laddr);
+  }
+
   laddr_t get_end_addr() const {
-    return addr + len;
+    return *(addr_info.existing_laddr) + len;
   }
 
   static extent_to_write_t create_data(
@@ -89,21 +89,21 @@ struct extent_to_write_t {
   }
 
   static extent_to_write_t create_existing(
-      laddr_t addr, paddr_t existing_paddr, extent_len_t len) {
-    return extent_to_write_t(addr, existing_paddr, len);
+      to_write_addr_info_t addr_info, extent_len_t len) {
+    return extent_to_write_t(addr_info, len);
   }
 
 private:
   extent_to_write_t(laddr_t addr, bufferlist to_write)
-    : type(type_t::DATA), addr(addr), len(to_write.length()),
-      to_write(to_write) {}
+    : type(type_t::DATA), addr_info(to_write_addr_info_t(addr)),
+    to_write(to_write), len(to_write.length()) {}
 
   extent_to_write_t(laddr_t addr, extent_len_t len)
-    : type(type_t::ZERO), addr(addr), len(len) {}
+    : type(type_t::ZERO), addr_info(to_write_addr_info_t(addr)), len(len) {}
 
-  extent_to_write_t(laddr_t addr, paddr_t existing_paddr, extent_len_t len)
-    : type(type_t::EXISTING), addr(addr), len(len),
-      to_write(std::nullopt), existing_paddr(existing_paddr) {}
+  extent_to_write_t(to_write_addr_info_t addr_info, extent_len_t len)
+    : type(type_t::EXISTING), addr_info(addr_info),
+    to_write(std::nullopt), len(len) {}
 };
 using extent_to_write_list_t = std::list<extent_to_write_t>;
 
@@ -118,7 +118,7 @@ void append_extent_to_write(
   extent_to_write_list_t &to_write, extent_to_write_t &&to_append)
 {
   assert(to_write.empty() ||
-         to_write.back().get_end_addr() == to_append.addr);
+         to_write.back().get_end_addr() == to_append.get_addr());
   if (to_write.empty() ||
       to_write.back().is_data() ||
       to_append.is_data() ||
@@ -181,26 +181,26 @@ ObjectDataHandler::write_ret do_insertions(
     [ctx](auto &region) {
       LOG_PREFIX(object_data_handler.cc::do_insertions);
       if (region.is_data()) {
-	assert_aligned(region.addr);
+	assert_aligned(region.get_addr());
 	assert_aligned(region.len);
 	ceph_assert(region.len == region.to_write->length());
 	DEBUGT("allocating extent: {}~{}",
 	       ctx.t,
-	       region.addr,
+	       region.get_addr(),
 	       region.len);
 	return ctx.tm.alloc_extent<ObjectDataBlock>(
 	  ctx.t,
-	  region.addr,
+	  region.get_addr(),
 	  region.len
 	).si_then([&region](auto extent) {
-	  if (extent->get_laddr() != region.addr) {
+	  if (extent->get_laddr() != region.get_addr()) {
 	    logger().debug(
 	      "object_data_handler::do_insertions alloc got addr {},"
 	      " should have been {}",
 	      extent->get_laddr(),
-	      region.addr);
+	      region.get_addr());
 	  }
-	  ceph_assert(extent->get_laddr() == region.addr);
+	  ceph_assert(extent->get_laddr() == region.get_addr());
 	  ceph_assert(extent->get_length() == region.len);
 	  auto iter = region.to_write->cbegin();
 	  iter.copy(region.len, extent->get_bptr().c_str());
@@ -209,42 +209,44 @@ ObjectDataHandler::write_ret do_insertions(
       } else if (region.is_zero()) {
 	DEBUGT("reserving: {}~{}",
 	       ctx.t,
-	       region.addr,
+	       region.get_addr(),
 	       region.len);
 	return ctx.tm.reserve_region(
 	  ctx.t,
-	  region.addr,
+	  region.get_addr(),
 	  region.len
 	).si_then([FNAME, ctx, &region](auto pin) {
 	  ceph_assert(pin->get_length() == region.len);
-	  if (pin->get_key() != region.addr) {
+	  if (pin->get_key() != region.get_addr()) {
 	    ERRORT(
 	      "inconsistent laddr: pin: {} region {}",
 	      ctx.t,
 	      pin->get_key(),
-	      region.addr);
+	      region.get_addr());
 	  }
-	  ceph_assert(pin->get_key() == region.addr);
+	  ceph_assert(pin->get_key() == region.get_addr());
 	  return ObjectDataHandler::write_iertr::now();
 	});
       } else {
 	ceph_assert(region.is_existing());
+        auto existing_laddr = *(region.addr_info.existing_laddr);
+        auto existing_paddr = *(region.addr_info.existing_paddr);
 	DEBUGT("map existing extent: laddr {} len {} {}",
-	       ctx.t, region.addr, region.len, *region.existing_paddr);
+	       ctx.t, existing_laddr, region.len, existing_paddr);
 	return ctx.tm.map_existing_extent<ObjectDataBlock>(
-	  ctx.t, region.addr, *region.existing_paddr, region.len
+	  ctx.t, region.addr_info, region.len
 	).handle_error_interruptible(
 	  TransactionManager::alloc_extent_iertr::pass_further{},
 	  Device::read_ertr::assert_all{"ignore read error"}
-	).si_then([FNAME, ctx, &region](auto extent) {
-	  if (extent->get_laddr() != region.addr) {
+	).si_then([FNAME, ctx, existing_laddr, &region](auto extent) {
+	  if (extent->get_laddr() != existing_laddr) {
 	    ERRORT(
 	      "inconsistent laddr: extent: {} region {}",
 	      ctx.t,
 	      extent->get_laddr(),
-	      region.addr);
+	      existing_laddr);
 	  }
-	  ceph_assert(extent->get_laddr() == region.addr);
+	  ceph_assert(extent->get_laddr() == existing_laddr);
 	  return ObjectDataHandler::write_iertr::now();
 	});
       }
@@ -341,6 +343,10 @@ public:
 
   extent_len_t get_pins_size() const {
     return pin_end - pin_begin;
+  }
+
+  extent_len_t get_aligned_extent_offset() const {
+    return aligned_data_end - pin_begin;
   }
 
   friend std::ostream& operator<<(
@@ -535,9 +541,13 @@ operate_ret operate_left(context_t ctx, LBAPinRef &pin, const overwrite_plan_t &
     assert(extent_len);
     std::optional<extent_to_write_t> left_to_write_extent =
       std::make_optional(extent_to_write_t::create_existing(
-        overwrite_plan.pin_begin,
-        overwrite_plan.left_paddr,
-        extent_len));
+        to_write_addr_info_t(
+          overwrite_plan.pin_begin,
+          overwrite_plan.left_paddr,
+          overwrite_plan.pin_begin,
+          overwrite_plan.left_paddr),
+        extent_len)
+      );
 
     auto prepend_len = overwrite_plan.get_left_alignment_size();
     if (prepend_len == 0) {
@@ -573,8 +583,9 @@ operate_ret operate_right(context_t ctx, LBAPinRef &pin, const overwrite_plan_t 
       std::nullopt);
   }
 
-  auto right_pin_begin = pin->get_key();
-  assert(overwrite_plan.data_end >= right_pin_begin);
+  auto right_pin_begin_laddr = pin->get_key();
+  auto right_pin_begin_paddr = pin->get_val();
+  assert(overwrite_plan.data_end >= right_pin_begin_laddr);
   if (overwrite_plan.right_operation == overwrite_operation_t::OVERWRITE_ZERO) {
     assert(pin->get_val().is_zero());
     auto zero_suffix_len = overwrite_plan.get_right_alignment_size();
@@ -597,7 +608,7 @@ operate_ret operate_right(context_t ctx, LBAPinRef &pin, const overwrite_plan_t 
         std::nullopt,
         std::nullopt);
     } else {
-      auto append_offset = overwrite_plan.data_end - right_pin_begin;
+      auto append_offset = overwrite_plan.data_end - right_pin_begin_laddr;
       return read_pin(ctx, pin->duplicate()
       ).si_then([append_offset, append_len](auto right_extent) {
         return get_iertr::make_ready_future<operate_ret_bare>(
@@ -612,12 +623,17 @@ operate_ret operate_right(context_t ctx, LBAPinRef &pin, const overwrite_plan_t 
     assert(overwrite_plan.right_operation == overwrite_operation_t::SPLIT_EXISTING);
 
     auto extent_len = overwrite_plan.get_right_extent_size();
+    auto offset = overwrite_plan.aligned_data_end - right_pin_begin_laddr;
     assert(extent_len);
     std::optional<extent_to_write_t> right_to_write_extent =
       std::make_optional(extent_to_write_t::create_existing(
-        overwrite_plan.aligned_data_end,
-        overwrite_plan.right_paddr.add_offset(overwrite_plan.aligned_data_end - right_pin_begin),
-        extent_len));
+        to_write_addr_info_t(
+          right_pin_begin_laddr,
+          right_pin_begin_paddr,
+          overwrite_plan.aligned_data_end,
+          overwrite_plan.right_paddr.add_offset(offset)),
+        extent_len)
+      );
 
     auto append_len = overwrite_plan.get_right_alignment_size();
     if (append_len == 0) {
@@ -625,7 +641,7 @@ operate_ret operate_right(context_t ctx, LBAPinRef &pin, const overwrite_plan_t 
         right_to_write_extent,
         std::nullopt);
     } else {
-      auto append_offset = overwrite_plan.data_end - right_pin_begin;
+      auto append_offset = overwrite_plan.data_end - right_pin_begin_laddr;
       return read_pin(ctx, pin->duplicate()
       ).si_then([append_offset, append_len,
                  right_to_write_extent=std::move(right_to_write_extent)]
@@ -889,7 +905,7 @@ ObjectDataHandler::write_ret ObjectDataHandler::overwrite(
                &to_write, &pins](auto p) mutable {
       auto &[left_extent, headptr] = p;
       if (left_extent) {
-        ceph_assert(left_extent->addr == overwrite_plan.pin_begin);
+        ceph_assert(left_extent->get_addr() == overwrite_plan.pin_begin);
         append_extent_to_write(to_write, std::move(*left_extent));
       }
       if (headptr) {
@@ -936,7 +952,7 @@ ObjectDataHandler::write_ret ObjectDataHandler::overwrite(
           append_extent_to_write(to_write, std::move(*right_extent));
         }
         assert(to_write.size());
-        assert(pin_begin == to_write.front().addr);
+        assert(pin_begin == to_write.front().get_addr());
         assert(pin_end == to_write.back().get_end_addr());
 
         return do_removals(ctx, pins);
