@@ -146,7 +146,68 @@ void splice_extent_to_write(
   }
 }
 
-/// Removes extents/mappings in pins
+/**
+ * do_remapping
+ *
+ * remapping exist extents.
+ */
+ObjectDataHandler::write_ret do_remapping(
+  context_t ctx,
+  extent_to_write_list_t &to_write)
+{
+  //get content buffer of origin extents
+  auto& front = to_write.front();
+  auto& back = to_write.back();
+  if (front.is_existing()) {
+    front.addr_info.set_bp(ctx.tm.get_remapped_buffer(
+      ctx.t,
+      *(front.addr_info.paddr)
+    ));
+  }
+  if (back.is_existing()) {
+    if (front.is_existing() &&
+      *(back.addr_info.laddr) == *(front.addr_info.laddr)) {
+      back.addr_info.set_bp(front.addr_info.get_bp());
+    } else {
+      back.addr_info.set_bp(ctx.tm.get_remapped_buffer(
+        ctx.t,
+        *(back.addr_info.paddr)
+      ));
+    }
+  }
+
+  return trans_intr::do_for_each(
+    to_write,
+    [ctx](auto &region) {
+      LOG_PREFIX(object_data_handler.cc::do_remapping);
+      if (region.is_existing()) {
+	ceph_assert(!region.is_data() && !region.is_zero());
+        auto existing_laddr = *(region.addr_info.existing_laddr);
+        auto existing_paddr = *(region.addr_info.existing_paddr);
+	DEBUGT("map existing extent: laddr {} len {} {}",
+	       ctx.t, existing_laddr, region.len, existing_paddr);
+        return ctx.tm.map_existing_extent<ObjectDataBlock>(
+	    ctx.t, region.addr_info, region.len
+	).handle_error_interruptible(
+	  TransactionManager::alloc_extent_iertr::pass_further{},
+	  Device::read_ertr::assert_all{"ignore read error"}
+	).si_then([FNAME, ctx, existing_laddr, &region](auto extent) {
+	  if (extent->get_laddr() != existing_laddr) {
+	    ERRORT(
+	      "inconsistent laddr: extent: {} region {}",
+	      ctx.t,
+	      extent->get_laddr(),
+	      existing_laddr);
+	  }
+          ceph_assert(extent->get_laddr() == existing_laddr);
+	  return ObjectDataHandler::write_iertr::now();
+	});
+      } else {
+        return ObjectDataHandler::write_iertr::now();
+      }
+  });
+}
+
 ObjectDataHandler::write_ret do_removals(
   context_t ctx,
   lba_pin_list_t &pins)
@@ -229,26 +290,7 @@ ObjectDataHandler::write_ret do_insertions(
 	});
       } else {
 	ceph_assert(region.is_existing());
-        auto existing_laddr = *(region.addr_info.existing_laddr);
-        auto existing_paddr = *(region.addr_info.existing_paddr);
-	DEBUGT("map existing extent: laddr {} len {} {}",
-	       ctx.t, existing_laddr, region.len, existing_paddr);
-	return ctx.tm.map_existing_extent<ObjectDataBlock>(
-	  ctx.t, region.addr_info, region.len
-	).handle_error_interruptible(
-	  TransactionManager::alloc_extent_iertr::pass_further{},
-	  Device::read_ertr::assert_all{"ignore read error"}
-	).si_then([FNAME, ctx, existing_laddr, &region](auto extent) {
-	  if (extent->get_laddr() != existing_laddr) {
-	    ERRORT(
-	      "inconsistent laddr: extent: {} region {}",
-	      ctx.t,
-	      extent->get_laddr(),
-	      existing_laddr);
-	  }
-	  ceph_assert(extent->get_laddr() == existing_laddr);
-	  return ObjectDataHandler::write_iertr::now();
-	});
+	return ObjectDataHandler::write_iertr::now();
       }
     });
 }
@@ -997,6 +1039,22 @@ ObjectDataHandler::write_ret ObjectDataHandler::overwrite(
         assert(pin_begin == to_write.front().get_addr());
         assert(pin_end == to_write.back().get_end_addr());
 
+	return do_remapping(ctx, to_write);
+      }).si_then([ctx, &pins,
+                  retire_front = overwrite_plan.to_retire_pins_front,
+                  retire_end = overwrite_plan.to_retire_pins_end] {
+	if (pins.size() == 1) {
+          if (!retire_front || !retire_end) {
+            pins.pop_back();
+          }
+        } else {
+          if (!retire_front) {
+            pins.pop_front();
+          }
+          if (!retire_end) {
+            pins.pop_back();
+          }
+        }
         return do_removals(ctx, pins);
       }).si_then([ctx, &to_write] {
         return do_insertions(ctx, to_write);

@@ -147,6 +147,7 @@ public:
       }
     ).si_then([FNAME, &t](auto ref) mutable -> ret {
       SUBTRACET(seastore_tm, "got extent -- {}", t, *ref);
+      assert(ref->has_actual_data());
       return pin_to_extent_ret<T>(
 	interruptible::ready_future_marker{},
 	std::move(ref));
@@ -334,6 +335,14 @@ public:
     });
   }
 
+  std::optional<ceph::bufferptr> get_remapped_buffer(
+    Transaction &t,
+    paddr_t paddr) {
+    LOG_PREFIX(TransactionManager::get_remapped_buffer);
+    SUBDEBUGT(seastore_tm, "paddr: {}", t, paddr);
+    return cache->get_remapped_buffer(t, paddr);
+  }
+
   /**
    * to_write_addr_info_t
    *
@@ -387,11 +396,25 @@ public:
   /**
    * map_existing_extent
    *
-   * Allocates a new extent at given existing_paddr that must be absolute and
-   * reads disk to fill the extent.
-   * The common usage is that remove the LogicalCachedExtent (laddr~length at paddr)
-   * and map extent to multiple new extents.
-   * placement_hint and generation should follow the original extent.
+   * Retire original extents according to to_retire recorded in addr_info,
+   * which is retirement strategy generated in overwrite_plan_t and allocates
+   * a new extent at given existing_paddr that must be absolute and fill
+   * the extent with existing data if there is.
+   * The common usage is that map extent to multiple new extents with neccesary
+   * original extents retirement according to information in addr_info,
+   * including laddr, paddr, buffer of original extents and the new laddr,
+   * paddr of existing extents.
+   *
+   * Get buffer of original extent outside the map_existing_extent and store it in
+   * addr_info is aim to avoid the situation that both lext and rext split and in
+   * the same original extent, then we will loss the ref to original extent's
+   * buffer after lext remapping with original extent retire.
+   * The control flow might be: retire lext(may not) - allocate new lext(may not) -
+   * retire rext(may not, maybe the same as last one) - allocate new rext(may not)
+   * - remove extents in do_removals(may not), so in order to avoid retiring 
+   * remapped extents or duplicate retirement, the retrement strategy might
+   * be bother. It is generated in overwrite_plan_t and pass to addr_info
+   * here.
    */
   using map_existing_extent_iertr =
     alloc_extent_iertr::extend_ertr<Device::read_ertr>;
@@ -403,51 +426,74 @@ public:
     Transaction &t,
     to_write_addr_info_t addr_info,
     extent_len_t length) {
+    LOG_PREFIX(TransactionManager::map_existing_extent);
     auto laddr = *(addr_info.laddr);
     auto paddr = *(addr_info.paddr);
     auto existing_laddr = *(addr_info.existing_laddr);
     auto existing_paddr = *(addr_info.existing_paddr);
     auto offset = addr_info.get_existing_loffset();
+    auto o_bp = addr_info.get_bp();
 
-    LOG_PREFIX(TransactionManager::map_existing_extent);
     // FIXME: existing_paddr can be absolute and pending
     ceph_assert(existing_paddr.is_absolute());
-    assert(t.is_retired(existing_paddr, length));
 
     SUBDEBUGT(seastore_tm, " laddr: {} paddr: {} existing_laddr: {}, "
               "existing_paddr: {} length: {}",
 	      t, laddr, paddr, existing_laddr, existing_paddr, length);
-    auto bp = ceph::bufferptr(buffer::create_page_aligned(length));
-    bp.zero();
+
+    std::optional<ceph::bufferptr> bp = std::nullopt;
+    if (o_bp.has_value()) {
+      bp = ceph::bufferptr(
+        *o_bp,
+        offset,
+        length);
+    }
 
     // ExtentPlacementManager::alloc_new_extent will make a new
     // (relative/temp) paddr, so make extent directly
     auto ext = CachedExtent::make_cached_extent_ref<T>(std::move(bp));
-
     ext->init(CachedExtent::extent_state_t::EXIST_CLEAN,
 	      existing_paddr,
 	      PLACEMENT_HINT_NULL,
 	      NULL_GENERATION);
 
-    t.add_fresh_extent(ext);
-
-    return lba_manager->alloc_extent(
-      t,
-      existing_laddr,
-      length,
-      existing_paddr
-    ).si_then([ext=std::move(ext), existing_laddr, this](auto &&ref) {
-      ceph_assert(existing_laddr == ref->get_key());
-      ext->set_pin(std::move(ref));
-      return epm->read(
-        ext->get_paddr(),
-	ext->get_length(),
-	ext->get_bptr()
-      ).safe_then([ext=std::move(ext)] {
-	return map_existing_extent_iertr::make_ready_future<TCachedExtentRef<T>>
+    if (!addr_info.to_retire) {
+      t.add_fresh_extent(ext);
+      return lba_manager->alloc_extent(
+        t,
+        existing_laddr,
+        length,
+        existing_paddr
+      ).si_then([this, ext = std::move(ext), existing_laddr,
+        length, existing_paddr](auto &&ref) {
+        assert(ref->get_key() == existing_laddr);
+        assert(ref->get_val() == existing_paddr);
+        assert(ref->get_length() == length);
+        ext->set_pin(std::move(ref));
+        return map_existing_extent_iertr::make_ready_future<TCachedExtentRef<T>>
 	  (std::move(ext));
       });
-    });
+    } else {
+      return dec_ref(t, laddr
+      ).si_then([this, &t, ext = std::move(ext), existing_laddr, length,
+        existing_paddr](auto result) {
+        t.add_fresh_extent(ext);
+        return lba_manager->alloc_extent(
+          t,
+          existing_laddr,
+          length,
+          existing_paddr
+        ).si_then([this, ext = std::move(ext), existing_laddr,
+          length, existing_paddr](auto &&ref) {
+          assert(ref->get_key() == existing_laddr);
+          assert(ref->get_val() == existing_paddr);
+          assert(ref->get_length() == length);
+          ext->set_pin(std::move(ref));
+          return map_existing_extent_iertr::make_ready_future<TCachedExtentRef<T>>
+	    (std::move(ext));
+        });
+      });
+    }
   }
 
 

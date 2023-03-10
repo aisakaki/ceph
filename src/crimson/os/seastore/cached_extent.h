@@ -398,6 +398,12 @@ public:
     return *ptr;
   }
 
+  /// set raw buffer if there is no actual data
+  void set_bptr(ceph::bufferptr nptr) {
+    assert(!ptr.has_value());
+    ptr = nptr;
+  }
+
   /// Compare by paddr
   friend bool operator< (const CachedExtent &a, const CachedExtent &b) {
     return a.poffset < b.poffset;
