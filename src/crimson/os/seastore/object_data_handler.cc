@@ -305,12 +305,20 @@ struct overwrite_plan_t {
   laddr_t aligned_data_begin;
   laddr_t aligned_data_end;
 
+  laddr_t right_pin_begin;
+
   // operations
   overwrite_operation_t left_operation;
   overwrite_operation_t right_operation;
 
   // helper member
   extent_len_t block_size;
+
+  // retirement behaviors
+  bool to_retire_left = false;
+  bool to_retire_right = false;
+  bool to_retire_pins_front = false;
+  bool to_retire_pins_end = false;
 
 public:
   extent_len_t get_left_size() const {
@@ -361,9 +369,14 @@ public:
 	       << ", data_end=" << overwrite_plan.data_end
 	       << ", aligned_data_begin=" << overwrite_plan.aligned_data_begin
 	       << ", aligned_data_end=" << overwrite_plan.aligned_data_end
+               << ", right_pin_begin=" << overwrite_plan.right_pin_begin
 	       << ", left_operation=" << overwrite_plan.left_operation
 	       << ", right_operation=" << overwrite_plan.right_operation
 	       << ", block_size=" << overwrite_plan.block_size
+               <<" , to_retire_left="<< overwrite_plan.to_retire_left
+               <<" , to_retire_right="<< overwrite_plan.to_retire_right
+               <<" , to_retire_pins_front="<< overwrite_plan.to_retire_pins_front
+               <<" , to_retire_pins_end="<< overwrite_plan.to_retire_pins_end
 	       << ")";
   }
 
@@ -379,6 +392,7 @@ public:
       data_end(offset + len),
       aligned_data_begin(p2align((uint64_t)data_begin, (uint64_t)block_size)),
       aligned_data_end(p2roundup((uint64_t)data_end, (uint64_t)block_size)),
+      right_pin_begin(pins.back()->get_key()),
       left_operation(overwrite_operation_t::UNKNOWN),
       right_operation(overwrite_operation_t::UNKNOWN),
       block_size(block_size) {
@@ -401,6 +415,7 @@ private:
     ceph_assert(data_begin <= data_end);
     ceph_assert(data_end <= aligned_data_end);
     ceph_assert(aligned_data_end <= pin_end);
+    ceph_assert(pin_begin <= right_pin_begin);
   }
 
   /*
@@ -474,6 +489,31 @@ private:
       // no split right, so merge with right
       right_operation = overwrite_operation_t::MERGE_EXISTING;
     }
+
+    // prepare left extent/right extent/do_removals retirement behaviors.
+    // this is to avoid retiring remapped extents or duplicate retirement.
+    if (left_operation == overwrite_operation_t::SPLIT_EXISTING &&
+      right_operation == overwrite_operation_t::SPLIT_EXISTING) {
+      to_retire_left = true;
+      if (pin_begin != right_pin_begin) {
+        to_retire_right = true;
+      }
+    } else if (left_operation == overwrite_operation_t::SPLIT_EXISTING &&
+      right_operation != overwrite_operation_t::SPLIT_EXISTING) {
+      to_retire_left = true;
+      if (pin_begin != right_pin_begin) {
+        to_retire_pins_end = true;
+      }
+    } else if (left_operation != overwrite_operation_t::SPLIT_EXISTING &&
+      right_operation == overwrite_operation_t::SPLIT_EXISTING) {
+      to_retire_right = true;
+      if (pin_begin != right_pin_begin) {
+        to_retire_pins_front = true;
+      }
+    } else {
+      to_retire_pins_front = true;
+      to_retire_pins_end = true;
+    }
   }
 };
 
@@ -545,7 +585,8 @@ operate_ret operate_left(context_t ctx, LBAPinRef &pin, const overwrite_plan_t &
           overwrite_plan.pin_begin,
           overwrite_plan.left_paddr,
           overwrite_plan.pin_begin,
-          overwrite_plan.left_paddr),
+          overwrite_plan.left_paddr,
+          overwrite_plan.to_retire_left),
         extent_len)
       );
 
@@ -631,7 +672,8 @@ operate_ret operate_right(context_t ctx, LBAPinRef &pin, const overwrite_plan_t 
           right_pin_begin_laddr,
           right_pin_begin_paddr,
           overwrite_plan.aligned_data_end,
-          overwrite_plan.right_paddr.add_offset(offset)),
+          overwrite_plan.right_paddr.add_offset(offset),
+          overwrite_plan.to_retire_right),
         extent_len)
       );
 

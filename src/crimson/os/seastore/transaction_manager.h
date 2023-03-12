@@ -353,6 +353,8 @@ public:
     std::optional<laddr_t> existing_laddr;
     /// paddr of existing extent
     std::optional<paddr_t> existing_paddr;
+    /// origin extent retirement behaviors
+    bool to_retire = false;
 
     /// content bufferptr of original extent
     std::optional<ceph::bufferptr> bp;
@@ -377,9 +379,9 @@ public:
 
     /// used when extent_to_write_t.type == EXISTING
     to_write_addr_info_t(laddr_t laddr, paddr_t paddr,
-      laddr_t existing_laddr, paddr_t existing_paddr)
-      : laddr(laddr), paddr(paddr),
-      existing_laddr(existing_laddr), existing_paddr(existing_paddr) {}
+      laddr_t existing_laddr, paddr_t existing_paddr, bool to_retire)
+       : laddr(laddr), paddr(paddr), existing_laddr(existing_laddr),
+      existing_paddr(existing_paddr), to_retire(to_retire) {}
   };
 
   /**
