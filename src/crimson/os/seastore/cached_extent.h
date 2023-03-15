@@ -407,6 +407,11 @@ public:
     return *ptr;
   }
 
+  /// set bufferptr
+  void set_bptr(ceph::bufferptr nptr) {
+    ptr = nptr;
+  }
+
   /// Compare by paddr
   friend bool operator< (const CachedExtent &a, const CachedExtent &b) {
     return a.poffset < b.poffset;
