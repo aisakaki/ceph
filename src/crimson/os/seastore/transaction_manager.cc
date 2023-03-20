@@ -738,4 +738,73 @@ TransactionManagerRef make_transaction_manager(
     std::move(backref_manager));
 }
 
+  template <typename T>
+  alloc_existing_extent_ret<T> alloc_existing_extent(
+    Transaction &t,
+    laddr_t existing_laddr,
+    paddr_t existing_paddr,
+    extent_len_t length,
+    std::optional<ceph::bufferptr> bp) {
+    LOG_PREFIX(TransactionManager::alloc_existing_extent);
+    SUBDEBUG(seastore_tm, "alloc existing extent: existing_laddr: {}, ",
+      "existing_paddr: {}, length: {}, has data in cache: {}",
+      existing_laddr, existing_paddr, length, bp.has_value()? "true" : "false");
+    std::optional<ceph::bufferptr> nbp;
+    if (bp.has_value()) {
+      nbp = ceph::bufferptr(
+        *bp,
+        bp->length() - length,
+        length);
+    } else {
+      nbp = std::nullopt
+    }
+
+    // ExtentPlacementManager::alloc_new_extent will make a new
+    // (relative/temp) paddr, so make extent directly
+    auto ext = CachedExtent::make_cached_extent_ref<T>(std::move(nbp));
+    ext->init(CachedExtent::extent_state_t::EXIST_CLEAN,
+	      existing_paddr,
+	      PLACEMENT_HINT_NULL,
+	      NULL_GENERATION);
+
+    t.add_fresh_extent(ext);
+
+    return lba_manager->alloc_extent(
+      t,
+      existing_laddr,
+      length,
+      existing_paddr
+    ).si_then([this, ext = std::move(ext), existing_laddr,
+      length, existing_paddr](auto &&ref) {
+      assert(ref->get_key() == existing_laddr);
+      assert(ref->get_val() == existing_paddr);
+      assert(ref->get_length() == length);
+      ext->set_pin(std::move(ref));
+      return alloc_existing_extent::make_ready_future<TCachedExtentRef<T>>
+	(std::move(ext));
+    });
+  }
+
+  template <typename T>
+  alloc_existing_extent_ret<T> alloc_existing_extent(
+    Transaction &t,
+    laddr_t laddr, //to retire
+    laddr_t existing_laddr,
+    paddr_t existing_paddr,
+    extent_len_t length,
+    std::optional<ceph::bufferptr> bp) {
+    LOG_PREFIX(TransactionManager::alloc_existing_extent);
+    SUBDEBUG(seastore_tm, "retire extent at {} and alloc existing extent",
+      t, laddr);
+    return dec_ref(t, laddr
+    ).si_then([this, &t, existing_laddr, existing_paddr, length, bp] {
+      return alloc_existing_extent(
+        t,
+        existing_laddr,
+        existing_paddr,
+        length,
+        bp);
+    });
+  }
+
 }

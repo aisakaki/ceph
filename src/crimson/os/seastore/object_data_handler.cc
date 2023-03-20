@@ -146,7 +146,87 @@ void splice_extent_to_write(
   }
 }
 
-/// Removes extents/mappings in pins
+/**
+ * do_remapping
+ *
+ * remapping exist extents.
+ * return remapped extents' addrs
+ */
+using do_remapping_iertr = base_iertr;
+using do_remapping_ret = do_remapping_iertr::future<std::vector<laddr_t>>;
+do_remapping_ret do_remapping(
+  context_t ctx,
+  extent_to_write_list_t &to_write)
+{
+  assert(to_write.size() != 0);
+  assert(!(to_write.size() == 1 && to_write.front().is_existing()));
+  auto& front = to_write.front();
+  auto& back = to_write.back();
+  auto& addr_info_left = front.addr_info;
+  auto& addr_info_right = back.addr_info;
+  if (!front.is_existing() && !back.is_existing()) {
+    return std::vector<laddr_t>();
+  }
+  if (front.is_existing() && back.is_existing()) {
+    return ctx.tm.split_extents(
+      t, addr_info_left, addr_info_right, front.len, back.len
+    ).handle_error_interruptible(
+      TransactionManager::split_extents_iertr::pass_further{},
+      Device::read_ertr::assert_all{"ignore read error"}
+    ).si_then([FNAME, ctx, &addr_info_left, &addr_info_right](auto extents) {
+      auto &[lext, rext] = extents;//[FIXME]根据下面的做法来想是&or not
+      auto laddr = *(addr_info_left.existing_laddr);
+      auto raddr = *(addr_info_right.existing_laddr);
+      if (lext->get_laddr() != laddr) {
+        ERRORT(
+          "inconsistent laddr: left extent: {} region {}",
+          ctx.t,
+          lext->get_laddr(),
+          laddr);
+      }
+      if (rext->get_laddr() != raddr) {
+        ERRORT(
+          "inconsistent laddr: right extent: {} region {}",
+          ctx.t,
+          rext->get_laddr(),
+          raddr);
+      }
+      ceph_assert(extent->get_laddr() == laddr);
+      ceph_assert(extent->get_laddr() == raddr);
+      return do_remapping_ret::make_ready_future<std::vector<laddr_t>>(
+        std::vector<laddr_t>{laddr, raddr});
+    });
+  }
+  return seastar::futurize_invoke([ctx, &front, &back,
+    &addr_info_left, &addr_info_right] {
+    to_write_addr_info_t &addr_info;//[FIXME]左值引用初始化必须赋值
+    extent_len_t len;
+    if (front.is_existing()) {
+      addr_info = addr_info_left;
+      len = front.len;
+    } else if (back.is_existing()) {
+      addr_info = addr_info_right;
+      len = back.len;
+    }
+    return ctx.tm.split_extent(t, addr_info, len);
+  }).handle_error_interruptible(
+    TransactionManager::alloc_extent_iertr::pass_further{},
+    Device::read_ertr::assert_all{"ignore read error"}
+  ).si_then([FNAME, ctx, addr_info](auto extent) {  //addr_info &?
+    auto addr = *(addr_info.existing_laddr);
+    if (extent->get_laddr() != addr) {
+      ERRORT(
+        "inconsistent laddr: extent: {} region {}",
+	ctx.t,
+	extent->get_laddr(),
+	addr);
+    }
+    ceph_assert(extent->get_laddr() == addr);
+    return do_remapping_ret::make_ready_future<std::vector<laddr_t>>(
+      std::vector<laddr_t>{extent->get_laddr()});
+  });
+}
+
 ObjectDataHandler::write_ret do_removals(
   context_t ctx,
   lba_pin_list_t &pins)
@@ -229,26 +309,7 @@ ObjectDataHandler::write_ret do_insertions(
 	});
       } else {
 	ceph_assert(region.is_existing());
-        auto existing_laddr = *(region.addr_info.existing_laddr);
-        auto existing_paddr = *(region.addr_info.existing_paddr);
-	DEBUGT("map existing extent: laddr {} len {} {}",
-	       ctx.t, existing_laddr, region.len, existing_paddr);
-	return ctx.tm.map_existing_extent<ObjectDataBlock>(
-	  ctx.t, region.addr_info, region.len
-	).handle_error_interruptible(
-	  TransactionManager::alloc_extent_iertr::pass_further{},
-	  Device::read_ertr::assert_all{"ignore read error"}
-	).si_then([FNAME, ctx, existing_laddr, &region](auto extent) {
-	  if (extent->get_laddr() != existing_laddr) {
-	    ERRORT(
-	      "inconsistent laddr: extent: {} region {}",
-	      ctx.t,
-	      extent->get_laddr(),
-	      existing_laddr);
-	  }
-	  ceph_assert(extent->get_laddr() == existing_laddr);
-	  return ObjectDataHandler::write_iertr::now();
-	});
+	return ObjectDataHandler::write_iertr::now();
       }
     });
 }
@@ -955,6 +1016,16 @@ ObjectDataHandler::write_ret ObjectDataHandler::overwrite(
         assert(pin_begin == to_write.front().get_addr());
         assert(pin_end == to_write.back().get_end_addr());
 
+	return do_remapping(ctx, to_write);
+      }).si_then([ctx, &pins](auto to_ignore) {
+        for (auto& addr : to_ignore) {
+          if (!pins.empty() && pins.front == addr) {
+            pins.pop_front();
+          }
+          if (!pins.empty() && pins.back == addr) {
+            pins.pop_back();
+          }
+        }
         return do_removals(ctx, pins);
       }).si_then([ctx, &to_write] {
         return do_insertions(ctx, to_write);
