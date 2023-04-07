@@ -147,6 +147,7 @@ public:
       }
     ).si_then([FNAME, &t](auto ref) mutable -> ret {
       SUBTRACET(seastore_tm, "got extent -- {}", t, *ref);
+      assert(ref->has_actual_data());
       return pin_to_extent_ret<T>(
 	interruptible::ready_future_marker{},
 	std::move(ref));
@@ -335,65 +336,216 @@ public:
   }
 
   /**
-   * map_existing_extent
+   * remap_pin
    *
-   * Allocates a new extent at given existing_paddr that must be absolute and
-   * reads disk to fill the extent.
-   * The common usage is that remove the LogicalCachedExtent (laddr~length at paddr)
-   * and map extent to multiple new extents.
-   * placement_hint and generation should follow the original extent.
+   * remap original extent to new extent.
+   * return the pin of new extent.
    */
-  using map_existing_extent_iertr =
-    alloc_extent_iertr::extend_ertr<Device::read_ertr>;
+  using remap_pin_iertr = base_iertr;
+  using remap_pin_ret = remap_pin_iertr::future<LBAPinRef>;
   template <typename T>
-  using map_existing_extent_ret =
-    map_existing_extent_iertr::future<TCachedExtentRef<T>>;
-  template <typename T>
-  map_existing_extent_ret<T> map_existing_extent(
+  remap_pin_ret remap_pin(
     Transaction &t,
-    laddr_t laddr_hint,
-    paddr_t existing_paddr,
-    extent_len_t length) {
-    LOG_PREFIX(TransactionManager::map_existing_extent);
-    // FIXME: existing_paddr can be absolute and pending
-    ceph_assert(existing_paddr.is_absolute());
-    assert(t.is_retired(existing_paddr, length));
+    LBAPinRef &&pin,
+    extent_len_t new_offset,
+    extent_len_t new_len) {
+    LOG_PREFIX(TransactionManager::remap_pin);
+    auto laddr = pin->get_key() + new_offset;
+    auto paddr = pin->get_val().add_offset(new_offset);
+    // FIXME: paddr can be absolute and pending
+    ceph_assert(pin->get_val().is_absolute());
+    ceph_assert(pin->get_length() > new_len);
 
-    SUBDEBUGT(seastore_tm, " laddr_hint: {} existing_paddr: {} length: {}",
-	      t, laddr_hint, existing_paddr, length);
-    auto bp = ceph::bufferptr(buffer::create_page_aligned(length));
-    bp.zero();
+    SUBDEBUGT(seastore_tm, "remapping on {} side,"
+      " original laddr: {}, original paddr: {}, original length: {}"
+      " new laddr: {}, new paddr: {}, length: {}", t,
+      new_offset == 0 ? "left" : "right",
+      pin->get_key(), pin->get_val(), pin->get_length(),
+      laddr, paddr, new_len);
+    return cache->get_extent_if_cached(
+      t, pin->get_val(), T::TYPE
+    ).si_then([this, &t, original_addr = pin->get_key(),
+              laddr, paddr, new_len](auto ext) {
+      std::optional<ceph::bufferptr> bp;
+      if (ext) {
+        ceph_assert(ext->get_length() > new_len);
+        bp = ext->get_bptr();
+      } else {
+        bp = std::nullopt;
+      }
+      return alloc_existing_extent_with_retire<T>(
+        t,
+        laddr,
+        paddr,
+        new_len,
+        original_addr,
+        std::move(bp)
+      ).handle_error_interruptible(
+          remap_pin_iertr::pass_further{},
+          crimson::ct_error::assert_all{
+            "TransactionManager::remap_pin hit invalid error"
+          }
+      ).si_then([&t, laddr](auto ext) {
+        if (ext->get_laddr() != laddr) {
+          LOG_PREFIX(TransactionManager::remap_pin);
+          SUBERRORT(
+            seastore_tm,
+            "remap extent inconsistent laddr"
+            "got: {} should have been {}",
+            t,
+            ext->get_laddr(),
+            laddr);
+        }
+        ceph_assert(ext->get_laddr() == laddr);
+        return remap_pin_iertr::make_ready_future<LBAPinRef>(
+          ext->get_pin().duplicate());
+      });
+    });
+  } 
 
-    // ExtentPlacementManager::alloc_new_extent will make a new
-    // (relative/temp) paddr, so make extent directly
-    auto ext = CachedExtent::make_cached_extent_ref<T>(std::move(bp));
+  /**
+   * overwrite_pin
+   * 
+   * Overwrite extent inside the original extent.
+   * Return the tuple of splited extents and overwrite extent.
+   * One of left pin or right pin can be nullptr.
+   */
+  using overwrite_pin_iertr = base_iertr;
+  template <typename T>
+  using overwrite_pin_ret = overwrite_pin_iertr::future<
+    std::tuple<LBAPinRef, TCachedExtentRef<T>, LBAPinRef>>;
+  template <typename T>
+  overwrite_pin_ret<T> overwrite_pin(
+    Transaction &t,
+    LBAPinRef &&pin,
+    extent_len_t new_offset,
+    extent_len_t new_len,
+    ceph::bufferlist &bl) {
+    LOG_PREFIX(TransactionManager::overwrite_pin);
+    // FIXME: paddr can be absolute and pending
+    ceph_assert(pin->get_val().is_absolute());
 
-    ext->init(CachedExtent::extent_state_t::EXIST_CLEAN,
-	      existing_paddr,
-	      PLACEMENT_HINT_NULL,
-	      NULL_GENERATION);
+    auto original_laddr = pin->get_key();
+    auto original_paddr = pin->get_val();
+    auto original_length = pin->get_length();
+    auto l_laddr = original_laddr;
+    auto l_paddr = original_paddr;
+    auto l_len = new_offset;
+    auto o_laddr = original_laddr + new_offset;
+    auto o_paddr = original_paddr.add_offset(new_offset);
+    auto o_len = new_len;
+    auto r_laddr = original_laddr + l_len + o_len;
+    auto r_paddr = original_paddr.add_offset(l_len).add_offset(o_len);
+    auto r_len = original_length - l_len - o_len;
+    SUBDEBUGT(seastore_tm, "original laddr: {}, paddr: {}, length: {}"
+      " left new laddr: {}, paddr: {}, length: {}"
+      " overwrite new laddr: {}, paddr: {}, length: {}"
+      " right new laddr: {}, paddr: {}, length: {}",
+      t, original_laddr, original_paddr, original_length,
+      l_laddr, l_paddr, l_len,
+      o_laddr, o_paddr, o_len,
+      r_laddr, r_paddr, r_len);
+    ceph_assert(original_length > o_len);
+    ceph_assert(o_laddr >= original_laddr);
+    ceph_assert(o_laddr <= original_laddr + original_length);
 
-    t.add_fresh_extent(ext);
-
-    return lba_manager->alloc_extent(
-      t,
-      laddr_hint,
-      length,
-      existing_paddr
-    ).si_then([ext=std::move(ext), laddr_hint, this](auto &&ref) {
-      ceph_assert(laddr_hint == ref->get_key());
-      ext->set_pin(std::move(ref));
-      return epm->read(
-        ext->get_paddr(),
-	ext->get_length(),
-	ext->get_bptr()
-      ).safe_then([ext=std::move(ext)] {
-	return map_existing_extent_iertr::make_ready_future<TCachedExtentRef<T>>
-	  (std::move(ext));
+    return seastar::do_with(
+      CachedExtentRef(),
+      TCachedExtentRef<T>(),
+      TCachedExtentRef<T>(),
+      [=, this, &t, &bl](auto &oext, auto &lext, auto &rext) {
+      return cache->get_extent_if_cached(
+        t, original_paddr, T::TYPE
+      ).si_then([=, this, &t, &bl, &oext](auto ext) {
+        oext = ext;
+        //alloc with retire if lext need split
+        if (l_len != 0) {
+          return alloc_existing_extent_with_retire<T>(
+            t,
+            l_laddr,
+            l_paddr,
+            l_len,
+            original_laddr,
+            oext ? std::make_optional<ceph::bufferptr>(oext->get_bptr())
+                 : std::nullopt);
+        } else {
+          return alloc_existing_extent_iertr::make_ready_future<
+            TCachedExtentRef<T>>();
+        }
+      }).si_then([=, this, &t, &bl, &oext, &lext](auto _lext) {
+        lext = _lext;
+        // alloc without retire original extent to avoid retire new extent
+        // allocated just now if lext split, or, alloc with retirement.
+        if (r_len != 0) {
+          if (l_len != 0) {
+            assert(lext->get_laddr() == l_laddr);
+            return alloc_existing_extent<T>(
+              t,
+              r_laddr,
+              r_paddr,
+              r_len,
+              original_laddr,
+              oext ? std::make_optional<ceph::bufferptr>(oext->get_bptr())
+                   : std::nullopt);
+          } else {
+            assert(!lext);
+            return alloc_existing_extent_with_retire<T>(
+              t,
+              r_laddr,
+              r_paddr,
+              r_len,
+              original_laddr,
+              oext ? std::make_optional< ceph::bufferptr>(oext->get_bptr()) 
+                   : std::nullopt);
+          }
+        } else {
+          return alloc_existing_extent_iertr::make_ready_future<
+            TCachedExtentRef<T>>();
+        }
+      }).si_then([=, this, &t, &bl, &lext, &rext](auto _rext) {
+          rext = _rext;
+          if (r_len != 0) {
+            assert(rext->get_laddr() == r_laddr);
+          } else {
+            assert(!rext);
+          }
+          LOG_PREFIX(TransactionManager::overwrite_pin);
+          SUBDEBUGT(seastore_tm, "allocating extent: {}~{}",
+            t, o_laddr, o_len);
+          return alloc_extent<T>(
+            t,
+            o_laddr,
+            o_len);
+      }).handle_error_interruptible(
+        overwrite_pin_iertr::pass_further{},
+        crimson::ct_error::assert_all{
+          "TransactionManager::overwrite_pin hit invalid error"
+        }
+      ).si_then([this, &t, &bl, &lext, &rext, o_laddr, o_len](auto extent) {
+	if (extent->get_laddr() != o_laddr) {
+          LOG_PREFIX(TransactionManager::overwrite_pin);
+	  SUBERRORT(
+            seastore_tm,
+	    "alloc overwrite data extent "
+            "got addr {}, should have been {}",
+            t,
+	    extent->get_laddr(),
+	    o_laddr);
+	}
+	ceph_assert(extent->get_laddr() == o_laddr);
+	ceph_assert(extent->get_length() == o_len);
+        ceph_assert(lext || rext);
+        auto iter = bl.cbegin();
+        iter.copy(o_len, extent->get_bptr().c_str());
+        return overwrite_pin_iertr::make_ready_future<
+          std::tuple<LBAPinRef, TCachedExtentRef<T>, LBAPinRef>>(
+            std::make_tuple(
+              lext ? lext->get_pin().duplicate() : nullptr,
+              extent,
+              rext ? rext->get_pin().duplicate() : nullptr));
       });
     });
   }
-
 
   using reserve_extent_iertr = alloc_extent_iertr;
   using reserve_extent_ret = reserve_extent_iertr::future<LBAPinRef>;
@@ -642,6 +794,93 @@ private:
     Transaction &t,
     ExtentPlacementManager::dispatch_result_t dispatch_result,
     std::optional<journal_seq_t> seq_to_trim = std::nullopt);
+
+  /**
+   * alloc_existing_extent
+   *
+   * Allocates a new extent at given existing_paddr that must be absolute and 
+   * use the buffer to fill the new extent if buffer exists. Otherwise, will
+   * not read disk to fill the new extent.
+   * Returns the new extent.
+   */
+  using alloc_existing_extent_iertr =
+    alloc_extent_iertr::extend_ertr<Device::read_ertr>;
+  template <typename T>
+  using alloc_existing_extent_ret =
+    alloc_existing_extent_iertr::future<TCachedExtentRef<T>>;
+  template <typename T>
+  alloc_existing_extent_ret<T> alloc_existing_extent(
+    Transaction &t,
+    laddr_t existing_laddr,
+    paddr_t existing_paddr,
+    extent_len_t length,
+    laddr_t laddr,
+    std::optional<ceph::bufferptr> bp) {
+    LOG_PREFIX(TransactionManager::alloc_existing_extent);
+    SUBDEBUG(seastore_tm, "alloc existing extent: existing_laddr: {}, "
+      "existing_paddr: {}, length: {}, has data in cache: {} ",
+      existing_laddr, existing_paddr, length, bp.has_value()? "true" : "false");
+    assert(existing_laddr == laddr ||
+      (existing_laddr - laddr + length == bp->length()));
+    TCachedExtentRef<T> ext;
+    if (bp.has_value()) {
+      auto nbp = ceph::bufferptr(
+        *bp,
+        existing_laddr - laddr,
+        length);
+      // ExtentPlacementManager::alloc_new_extent will make a new
+      // (relative/temp) paddr, so make extent directly
+      ext = CachedExtent::make_cached_extent_ref<T>(std::move(nbp));
+    } else {
+      ext = CachedExtent::make_cached_extent_ref<T>(length);
+    }
+
+    ext->init(CachedExtent::extent_state_t::EXIST_CLEAN,
+	      existing_paddr,
+	      PLACEMENT_HINT_NULL,
+	      NULL_GENERATION);
+
+    t.add_fresh_extent(ext);
+
+    return lba_manager->alloc_extent(
+      t,
+      existing_laddr,
+      length,
+      existing_paddr
+    ).si_then([FNAME, ext = std::move(ext), existing_laddr,
+        length, existing_paddr](auto &&ref) mutable {
+      assert(ref->get_key() == existing_laddr);
+      assert(ref->get_val() == existing_paddr);
+      assert(ref->get_length() == length);
+      ext->set_pin(std::move(ref));
+      return alloc_existing_extent_iertr::make_ready_future
+        <TCachedExtentRef<T>>(std::move(ext));
+    });
+  }
+
+  template <typename T>
+  alloc_existing_extent_ret<T> alloc_existing_extent_with_retire(
+    Transaction &t,
+    laddr_t existing_laddr,
+    paddr_t existing_paddr,
+    extent_len_t length,
+    laddr_t laddr,
+    std::optional<ceph::bufferptr> bp) {
+    LOG_PREFIX(TransactionManager::alloc_existing_extent_with_retire);
+    SUBDEBUGT(seastore_tm, "retire extent at {} and alloc existing extent",
+      t, laddr);
+    return dec_ref(t, laddr
+    ).si_then([this, FNAME, &t, existing_laddr, existing_paddr, length,
+      laddr, bp](auto) {
+      return alloc_existing_extent<T>(
+        t,
+        existing_laddr,
+        existing_paddr,
+        length,
+        laddr,
+        bp);
+    });
+  }
 
 public:
   // Testing interfaces
