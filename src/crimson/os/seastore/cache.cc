@@ -1010,6 +1010,15 @@ CachedExtentRef Cache::duplicate_for_write(
     i->version++;
     i->state = CachedExtent::extent_state_t::EXIST_MUTATION_PENDING;
     i->last_committed_crc = i->get_crc32c();
+    // deepcopy the buffer of exist clean extent beacuse it shares
+    // buffer with original clean extent.
+    auto bp = i->get_bptr();
+    auto len = bp.length();
+    char *nb = new char[len];
+    bp.copy_out(0, len, nb);
+    auto nbp = ceph::bufferptr(nb, len);
+    i->set_bptr(nbp);
+
     t.add_mutated_extent(i);
     DEBUGT("duplicate existing extent {}", t, *i);
     return i;
