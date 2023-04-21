@@ -681,6 +681,93 @@ private:
     });
   }
 
+  /**
+   * alloc_remapped_extent
+   *
+   * Allocates a new extent at given remap_paddr that must be absolute and
+   * use the buffer to fill the new extent if buffer exists. Otherwise, will
+   * not read disk to fill the new extent.
+   * Returns the new extent.
+   *
+   * Should make sure the end laddr of remap extent <= the end laddr of
+   * original extent when using this method.
+   */
+  using alloc_remapped_extent_iertr =
+    alloc_extent_iertr::extend_ertr<Device::read_ertr>;
+  using alloc_remapped_extent_ret =
+    alloc_remapped_extent_iertr::future<LBAMappingRef>;
+  template <typename T>
+  alloc_remapped_extent_ret alloc_remapped_extent(
+    Transaction &t,
+    laddr_t remap_laddr,
+    paddr_t remap_paddr,
+    extent_len_t remap_length,
+    laddr_t original_laddr,
+    std::optional<ceph::bufferptr> bp) {
+    LOG_PREFIX(TransactionManager::alloc_remapped_extent);
+    SUBDEBUG(seastore_tm, "alloc existing extent: remap_laddr: {}, "
+      "remap_paddr: {}, remap_length: {}, has data in cache: {} ",
+      remap_laddr, remap_paddr, remap_length, bp.has_value()? "true":"false");
+    assert(remap_laddr >= original_laddr);
+    TCachedExtentRef<T> ext;
+    if (bp.has_value()) {
+      auto nbp = ceph::bufferptr(
+        *bp,
+        remap_laddr - original_laddr,
+        remap_length);
+      // ExtentPlacementManager::alloc_new_extent will make a new
+      // (relative/temp) paddr, so make extent directly
+      ext = CachedExtent::make_cached_extent_ref<T>(std::move(nbp));
+    } else {
+      ext = CachedExtent::make_placeholder_cached_extent_ref<T>(remap_length);
+    }
+
+    ext->init(CachedExtent::extent_state_t::EXIST_CLEAN,
+	      remap_paddr,
+	      PLACEMENT_HINT_NULL,
+	      NULL_GENERATION,
+              t.get_trans_id());
+
+    t.add_fresh_extent(ext);
+
+    return lba_manager->alloc_extent(
+      t,
+      remap_laddr,
+      remap_length,
+      remap_paddr,
+      ext.get()
+    ).si_then([remap_laddr, remap_length, remap_paddr](auto &&ref) {
+      assert(ref->get_key() == remap_laddr);
+      assert(ref->get_val() == remap_paddr);
+      assert(ref->get_length() == remap_length);
+      return alloc_remapped_extent_iertr::make_ready_future
+        <LBAMappingRef>(std::move(ref));
+    });
+  }
+
+  template <typename T>
+  alloc_remapped_extent_ret alloc_remapped_extent_with_retire(
+    Transaction &t,
+    laddr_t remap_laddr,
+    paddr_t remap_paddr,
+    extent_len_t remap_length,
+    laddr_t original_laddr,
+    std::optional<ceph::bufferptr> bp) {
+    LOG_PREFIX(TransactionManager::alloc_remapped_extent_with_retire);
+    SUBDEBUGT(seastore_tm, "retire extent at {} and alloc existing extent",
+      t, original_laddr);
+    return dec_ref(t, original_laddr
+    ).si_then([this, &t, remap_laddr, remap_paddr, remap_length,
+      original_laddr, bp](auto) {
+      return alloc_remapped_extent<T>(
+        t,
+        remap_laddr,
+        remap_paddr,
+        remap_length,
+        original_laddr,
+        bp);
+    });
+  }
 
 public:
   // Testing interfaces
