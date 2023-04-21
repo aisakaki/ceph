@@ -292,6 +292,64 @@ public:
   }
 
   /**
+   * remap_pin
+   *
+   * Remap original extent to new extent.
+   * Return the pin of new extent.
+   */
+  using remap_pin_iertr = base_iertr;
+  using remap_pin_ret = remap_pin_iertr::future<LBAMappingRef>;
+  template <typename T>
+  remap_pin_ret remap_pin(
+    Transaction &t,
+    LBAMappingRef &&pin,
+    extent_len_t remap_offset,
+    extent_len_t remap_len) {
+    LOG_PREFIX(TransactionManager::remap_pin);
+    auto remap_laddr = pin->get_key() + remap_offset;
+    auto remap_paddr = pin->get_val().add_offset(remap_offset);
+    // FIXME: paddr can be absolute and pending
+    ceph_assert(pin->get_val().is_absolute());
+    ceph_assert(remap_offset < pin->get_length());
+    ceph_assert(remap_offset + remap_len <= pin->get_length());
+
+    SUBDEBUGT(seastore_tm, "remapping on {} side,"
+      " original laddr: {}, original paddr: {}, original length: {}"
+      " remap laddr: {}, remap paddr: {}, remap length: {}", t,
+      remap_offset == 0 ? "left" : "right",
+      pin->get_key(), pin->get_val(), pin->get_length(),
+      remap_laddr, remap_paddr, remap_len);
+    return cache->get_extent_if_cached(
+      t, pin->get_val(), T::TYPE
+    ).si_then([this, &t, original_laddr = pin->get_key(),
+              remap_laddr, remap_paddr, remap_len](auto ext) {
+      std::optional<ceph::bufferptr> bp;
+      if (ext) {
+        ceph_assert(ext->is_clean());
+        ceph_assert(ext->get_length() > remap_len);
+        bp = ext->get_bptr();
+      }
+      return alloc_remapped_extent_with_retire<T>(
+        t,
+        remap_laddr,
+        remap_paddr,
+        remap_len,
+        original_laddr,
+        std::move(bp)
+      ).handle_error_interruptible(
+          remap_pin_iertr::pass_further{},
+          crimson::ct_error::assert_all{
+            "TransactionManager::remap_pin hit invalid error"
+          }
+      ).si_then([remap_laddr](auto &&rpin) {
+        ceph_assert(rpin->get_key() == remap_laddr);
+        return remap_pin_iertr::make_ready_future<LBAMappingRef>(
+          std::move(rpin));
+      });
+    });
+  }
+
+  /**
    * map_existing_extent
    *
    * Allocates a new extent at given existing_paddr that must be absolute and
