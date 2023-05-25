@@ -410,6 +410,140 @@ public:
     });
   }
 
+  /**
+   * overwrite_pin
+   *
+   * Overwrite extent inside the original extent.
+   * Return the tuple of splited extents and overwrite extent.
+   * One of left pin or right pin can be nullptr.
+   */
+  using overwrite_pin_iertr = base_iertr;
+  template <typename T>
+  using overwrite_pin_ret = overwrite_pin_iertr::future<
+    std::tuple<LBAMappingRef, TCachedExtentRef<T>, LBAMappingRef>>;
+  template <typename T>
+  overwrite_pin_ret<T> overwrite_pin(
+    Transaction &t,
+    LBAMappingRef &&pin,
+    extent_len_t overwrite_offset,
+    extent_len_t overwrite_len,
+    ceph::bufferlist bl) {
+    LOG_PREFIX(TransactionManager::overwrite_pin);
+    // FIXME: paddr can be absolute and pending
+    ceph_assert(pin->get_val().is_absolute());
+
+    auto original_laddr = pin->get_key();
+    auto original_paddr = pin->get_val();
+    auto original_length = pin->get_length();
+    auto l_laddr = original_laddr;
+    auto l_paddr = original_paddr;
+    auto l_len = overwrite_offset;
+    auto o_laddr = original_laddr + overwrite_offset;
+    auto o_paddr = original_paddr.add_offset(overwrite_offset);
+    auto o_len = overwrite_len;
+    auto r_laddr = original_laddr + l_len + o_len;
+    auto r_paddr = original_paddr.add_offset(l_len + o_len);
+    auto r_len = original_length - l_len - o_len;
+    SUBDEBUGT(seastore_tm, "original laddr: {}, paddr: {}, length: {}"
+      " left new laddr: {}, paddr: {}, length: {}"
+      " overwrite new laddr: {}, paddr: {}, length: {}"
+      " right new laddr: {}, paddr: {}, length: {}",
+      t, original_laddr, original_paddr, original_length,
+      l_laddr, l_paddr, l_len,
+      o_laddr, o_paddr, o_len,
+      r_laddr, r_paddr, r_len);
+    ceph_assert(original_length > o_len);
+    ceph_assert(o_laddr >= original_laddr);
+    ceph_assert(o_len == bl.length());
+    ceph_assert(r_laddr <= original_laddr + original_length);
+
+    return seastar::do_with(
+      std::move(bl),
+      CachedExtentRef(),
+      LBAMappingRef(),
+      LBAMappingRef(),
+      [=, this, &t](auto &bl, auto &oext, auto &lpin, auto &rpin) mutable {
+      return cache->get_extent_if_cached(
+        t, original_paddr, T::TYPE
+      ).si_then([=, this, &t, &oext](auto ext) {
+        ceph_assert(ext ? ext->is_clean() : true);
+        oext = ext;
+        //alloc with retire if lext need split
+        if (l_len != 0) {
+          return alloc_remapped_extent_with_retire<T>(
+            t,
+            l_laddr,
+            l_paddr,
+            l_len,
+            original_laddr,
+            oext ? std::make_optional<ceph::bufferptr>(oext->get_bptr())
+                 : std::nullopt);
+        } else {
+          return alloc_remapped_extent_iertr::make_ready_future<
+            LBAMappingRef>();
+        }
+      }).si_then([=, this, &t, &oext, &lpin](auto _lpin) {
+        lpin.swap(_lpin);
+        // alloc without retire original extent to avoid retire new extent
+        // allocated just now if lext split, or, alloc with retirement.
+        if (r_len != 0) {
+          if (l_len != 0) {
+            assert(lpin->get_key() == l_laddr);
+            return alloc_remapped_extent<T>(
+              t,
+              r_laddr,
+              r_paddr,
+              r_len,
+              original_laddr,
+              oext ? std::make_optional<ceph::bufferptr>(oext->get_bptr())
+                   : std::nullopt);
+          } else {
+            assert(!lpin);
+            return alloc_remapped_extent_with_retire<T>(
+              t,
+              r_laddr,
+              r_paddr,
+              r_len,
+              original_laddr,
+              oext ? std::make_optional< ceph::bufferptr>(oext->get_bptr())
+                   : std::nullopt);
+          }
+        } else {
+          return alloc_remapped_extent_iertr::make_ready_future<
+            LBAMappingRef>();
+        }
+      }).si_then([=, this, &t, &rpin](auto _rpin) {
+          rpin.swap(_rpin);
+          if (r_len != 0) {
+            assert(rpin->get_key() == r_laddr);
+          } else {
+            assert(!rpin);
+          }
+          LOG_PREFIX(TransactionManager::overwrite_pin);
+          SUBDEBUGT(seastore_tm, "allocating extent: {}~{}",
+            t, o_laddr, o_len);
+          return alloc_extent<T>(
+            t,
+            o_laddr,
+            o_len);
+      }).handle_error_interruptible(
+        overwrite_pin_iertr::pass_further{},
+        crimson::ct_error::assert_all{
+          "TransactionManager::overwrite_pin hit invalid error"
+        }
+      ).si_then([&lpin, &rpin, &bl, o_laddr, o_len](auto extent) {
+	ceph_assert(extent->get_laddr() == o_laddr);
+	ceph_assert(extent->get_length() == o_len);
+        ceph_assert(lpin || rpin);
+        auto iter = bl.cbegin();
+        iter.copy(o_len, extent->get_bptr().c_str());
+        return overwrite_pin_iertr::make_ready_future<
+          std::tuple<LBAMappingRef, TCachedExtentRef<T>, LBAMappingRef>>(
+            std::make_tuple(
+              std::move(lpin), extent, std::move(rpin)));
+      });
+    });
+  }
 
   using reserve_extent_iertr = alloc_extent_iertr;
   using reserve_extent_ret = reserve_extent_iertr::future<LBAMappingRef>;
