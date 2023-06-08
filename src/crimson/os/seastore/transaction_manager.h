@@ -178,7 +178,7 @@ public:
   {
     auto v = pin->get_logical_extent(t);
     if (v.has_child()) {
-      return v.get_child_fut().then([](auto extent) {
+      return v.get_child_fut().safe_then([](auto extent) {
 	return extent->template cast<T>();
       });
     } else {
